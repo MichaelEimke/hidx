@@ -1,4 +1,5 @@
 #include "usb_hidx.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "driver_registry.h"
 #include <algorithm>
@@ -35,6 +36,14 @@ static uint32_t transfer_retry_delay(uint8_t failures) {
   const uint8_t shift = failures > 4 ? 4 : failures;
   return TRANSFER_RETRY_BASE_MS << shift;
 }
+
+struct HIDInterfaceCandidate {
+  const usb_intf_desc_t *intf;
+  const usb_ep_desc_t *in_ep;
+  uint8_t out_ep;
+};
+
+static constexpr size_t MAX_HID_INTERFACE_CANDIDATES = 8;
 
 static const char *usb_speed_name(usb_speed_t speed) {
   switch (speed) {
@@ -523,21 +532,16 @@ void USBHIDXComponent::handle_new_device(uint8_t address) {
 
   ESP_LOGI(TAG, "Config: wTotalLength=%d, bNumInterfaces=%d", config_desc->wTotalLength, config_desc->bNumInterfaces);
 
-  // Find the first usable HID interface. Composite devices are allowed to
-  // expose several HID interfaces, and the first matching interface is not
-  // necessarily the one with an interrupt-IN endpoint. Keep the current
-  // interface while walking its endpoint descriptors and only select a
-  // candidate once a valid interrupt-IN endpoint is found.
-  const usb_intf_desc_t *intf_desc = nullptr;
-  const usb_ep_desc_t *ep_desc = nullptr;
+  // Collect every usable HID interface. Composite devices often put a vendor
+  // or configuration HID interface first, so the interface that a configured
+  // driver handles is not necessarily the first one with an interrupt-IN
+  // endpoint. An OUT endpoint is only paired with the IN endpoint of the same
+  // interface.
+  StaticVector<HIDInterfaceCandidate, MAX_HID_INTERFACE_CANDIDATES> candidates;
+  HIDInterfaceCandidate *current_candidate = nullptr;
   const usb_intf_desc_t *current_intf = nullptr;
   bool current_intf_accepted = false;
-  uint8_t out_ep = 0;
   int offset = 0;
-
-  if (is_8bitdo) {
-    ESP_LOGI(TAG, "8BitDo - scanning all interfaces:");
-  }
 
   while (offset < config_desc->wTotalLength) {
     const usb_standard_desc_t *desc = (const usb_standard_desc_t *) ((uint8_t *) config_desc + offset);
@@ -553,6 +557,7 @@ void USBHIDXComponent::handle_new_device(uint8_t address) {
       }
       const usb_intf_desc_t *temp_intf = (const usb_intf_desc_t *) desc;
       current_intf = temp_intf;
+      current_candidate = nullptr;
       current_intf_accepted =
           temp_intf->bAlternateSetting == 0 &&
           (temp_intf->bInterfaceClass == 0x03 ||
@@ -560,22 +565,10 @@ void USBHIDXComponent::handle_new_device(uint8_t address) {
            (is_8bitdo && temp_intf->bInterfaceClass == 0xFF) ||
            (is_mce && (temp_intf->bInterfaceClass == 0xFF || temp_intf->bInterfaceClass == 0x03)));
 
-      if (is_8bitdo) {
-        ESP_LOGI(TAG, "  Intf %d: Class=0x%02X Sub=0x%02X Proto=0x%02X EPs=%d", temp_intf->bInterfaceNumber,
-                 temp_intf->bInterfaceClass, temp_intf->bInterfaceSubClass, temp_intf->bInterfaceProtocol,
-                 temp_intf->bNumEndpoints);
-      }
-      if (is_xbox360) {
-        ESP_LOGI(TAG, "  Intf %d: Class=0x%02X Sub=0x%02X Proto=0x%02X EPs=%d", temp_intf->bInterfaceNumber,
-                 temp_intf->bInterfaceClass, temp_intf->bInterfaceSubClass, temp_intf->bInterfaceProtocol,
-                 temp_intf->bNumEndpoints);
-      }
-
-      // Log rejected interfaces for MCE to help debug
-      if (is_mce && !current_intf_accepted) {
-        ESP_LOGI(TAG, "MCE intf %d: Class=0x%02X Sub=0x%02X Proto=0x%02X", temp_intf->bInterfaceNumber,
-                 temp_intf->bInterfaceClass, temp_intf->bInterfaceSubClass, temp_intf->bInterfaceProtocol);
-      }
+      ESP_LOGD(TAG, "Interface %d (alt %d): Class=0x%02X Sub=0x%02X Proto=0x%02X EPs=%d%s", temp_intf->bInterfaceNumber,
+               temp_intf->bAlternateSetting, temp_intf->bInterfaceClass, temp_intf->bInterfaceSubClass,
+               temp_intf->bInterfaceProtocol, temp_intf->bNumEndpoints,
+               current_intf_accepted ? LOG_STR_LITERAL("") : LOG_STR_LITERAL(" (skipped)"));
     } else if (desc->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT && current_intf_accepted) {
       if (desc->bLength < sizeof(usb_ep_desc_t)) {
         ESP_LOGW(TAG, "Short endpoint descriptor at offset %d", offset);
@@ -583,33 +576,38 @@ void USBHIDXComponent::handle_new_device(uint8_t address) {
       }
       const usb_ep_desc_t *temp_ep = (const usb_ep_desc_t *) desc;
       if ((temp_ep->bmAttributes & 0x03) == 0x03) {
-        if ((temp_ep->bEndpointAddress & 0x80) && ep_desc == nullptr) {
-          // Fix invalid bInterval=0 (ESP-IDF requires 1-255 for interrupt endpoints)
-          if (temp_ep->bInterval == 0) {
-            ESP_LOGW(TAG, "Fixing invalid bInterval=0 on IN endpoint 0x%02X", temp_ep->bEndpointAddress);
-            const_cast<usb_ep_desc_t *>(temp_ep)->bInterval = 1;
+        if ((temp_ep->bEndpointAddress & 0x80) && current_candidate == nullptr) {
+          if (candidates.size() == candidates.capacity()) {
+            ESP_LOGW(TAG, "Too many HID interfaces, ignoring interface %d", current_intf->bInterfaceNumber);
+            current_intf_accepted = false;
+          } else {
+            // Fix invalid bInterval=0 (ESP-IDF requires 1-255 for interrupt endpoints)
+            if (temp_ep->bInterval == 0) {
+              ESP_LOGW(TAG, "Fixing invalid bInterval=0 on IN endpoint 0x%02X", temp_ep->bEndpointAddress);
+              const_cast<usb_ep_desc_t *>(temp_ep)->bInterval = 1;
+            }
+            candidates.push_back({current_intf, temp_ep, 0});
+            current_candidate = &candidates[candidates.size() - 1];
+            ESP_LOGD(TAG, "Interface %d: interrupt IN endpoint 0x%02X (interval=%d)", current_intf->bInterfaceNumber,
+                     temp_ep->bEndpointAddress, temp_ep->bInterval);
           }
-          intf_desc = current_intf;
-          dev->protocol = current_intf->bInterfaceProtocol;
-          ep_desc = temp_ep;
-          ESP_LOGI(TAG, "Found HID interface %d, protocol %d, class 0x%02X", intf_desc->bInterfaceNumber, dev->protocol,
-                   intf_desc->bInterfaceClass);
-          ESP_LOGI(TAG, "Found interrupt IN endpoint: 0x%02X (interval=%d)", ep_desc->bEndpointAddress,
-                   ep_desc->bInterval);
-        } else if (!(temp_ep->bEndpointAddress & 0x80) && intf_desc == current_intf && out_ep == 0) {
+        } else if (!(temp_ep->bEndpointAddress & 0x80) && current_candidate != nullptr &&
+                   current_candidate->out_ep == 0) {
           if (temp_ep->bInterval == 0) {
             ESP_LOGW(TAG, "Fixing invalid bInterval=0 on OUT endpoint 0x%02X", temp_ep->bEndpointAddress);
             const_cast<usb_ep_desc_t *>(temp_ep)->bInterval = 1;
           }
-          out_ep = temp_ep->bEndpointAddress;
-          ESP_LOGI(TAG, "Found interrupt OUT endpoint: 0x%02X", out_ep);
+          current_candidate->out_ep = temp_ep->bEndpointAddress;
+          ESP_LOGD(TAG, "Interface %d: interrupt OUT endpoint 0x%02X", current_intf->bInterfaceNumber,
+                   current_candidate->out_ep);
         }
       }
     }
     offset += desc->bLength;
   }
 
-  if (!intf_desc || !ep_desc) {
+  if (candidates.empty()) {
+    ESP_LOGI(TAG, "No HID interface with an interrupt IN endpoint found");
     usb_host_device_close(this->client_hdl_, dev->dev_hdl);
     devices_.pop_back();
     return;
@@ -618,23 +616,44 @@ void USBHIDXComponent::handle_new_device(uint8_t address) {
   // Match before claiming an interface or allocating a long-lived transfer.
   // A configured registry is also a device filter: an unrelated HID device
   // must not consume a host channel merely because it happens to enumerate.
+  // Drivers are tried in registry order so that the generic gamepad fallback
+  // cannot take a vendor interface ahead of a more specific driver.
   HIDDeviceDriver *matched_driver_template = nullptr;
-  ESP_LOGI(TAG, "Attempting to match device (protocol=%d, VID=%04X, PID=%04X) to %u drivers", dev->protocol, dev->vid,
-           dev->pid, static_cast<unsigned>(this->drivers_.size()));
+  const HIDInterfaceCandidate *selected = nullptr;
+  ESP_LOGI(TAG, "Attempting to match device (VID=%04X, PID=%04X, %u HID interfaces) to %u drivers", dev->vid, dev->pid,
+           static_cast<unsigned>(candidates.size()), static_cast<unsigned>(this->drivers_.size()));
   for (const auto &driver_template : this->drivers_) {
     auto *driver = driver_template.get();
-    ESP_LOGD(TAG, "Checking driver: %s", driver->get_name());
-    if (driver->match_device(dev->protocol, dev->vid, dev->pid)) {
-      matched_driver_template = driver;
+    for (const auto &candidate : candidates) {
+      ESP_LOGD(TAG, "Checking driver %s on interface %d (protocol %d)", driver->get_name(),
+               candidate.intf->bInterfaceNumber, candidate.intf->bInterfaceProtocol);
+      if (driver->match_device(candidate.intf->bInterfaceProtocol, dev->vid, dev->pid)) {
+        matched_driver_template = driver;
+        selected = &candidate;
+        break;
+      }
+    }
+    if (selected != nullptr) {
       break;
     }
   }
-  if (matched_driver_template == nullptr && !this->has_raw_bindings_for(dev)) {
-    ESP_LOGI(TAG, "No selected driver matched %04X:%04X; ignoring device", dev->vid, dev->pid);
-    usb_host_device_close(this->client_hdl_, dev->dev_hdl);
-    devices_.pop_back();
-    return;
+  if (selected == nullptr) {
+    if (!this->has_raw_bindings_for(dev)) {
+      ESP_LOGI(TAG, "No selected driver matched %04X:%04X; ignoring device", dev->vid, dev->pid);
+      usb_host_device_close(this->client_hdl_, dev->dev_hdl);
+      devices_.pop_back();
+      return;
+    }
+    // Raw bindings select by VID/PID only, so keep the first interface for them.
+    selected = &candidates[0];
   }
+
+  const usb_intf_desc_t *intf_desc = selected->intf;
+  const usb_ep_desc_t *ep_desc = selected->in_ep;
+  const uint8_t out_ep = selected->out_ep;
+  dev->protocol = intf_desc->bInterfaceProtocol;
+  ESP_LOGI(TAG, "Using HID interface %d, protocol %d, class 0x%02X, IN endpoint 0x%02X, OUT endpoint 0x%02X",
+           intf_desc->bInterfaceNumber, dev->protocol, intf_desc->bInterfaceClass, ep_desc->bEndpointAddress, out_ep);
 
   // Claim interface
   err = usb_host_interface_claim(this->client_hdl_, dev->dev_hdl, intf_desc->bInterfaceNumber, 0);
