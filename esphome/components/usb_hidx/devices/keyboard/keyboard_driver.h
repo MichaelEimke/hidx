@@ -341,6 +341,17 @@ class KeyboardDriver : public HIDDeviceDriver {
 
   const char *get_name() override { return "Keyboard"; }
 
+  void on_device_removed() override {
+    // No release report arrives after an unplug, so keys held at that moment would stay pressed.
+#ifdef USE_BINARY_SENSOR
+    for (auto &kv : parent_->get_keyboard_key_sensors()) {
+      kv.second->publish_state(false);
+    }
+#endif
+    memset(prev_keys_, 0, sizeof(prev_keys_));
+    prev_modifier_ = 0;
+  }
+
  protected:
   USBHIDXComponent *parent_;
   uint8_t prev_keys_[6]{0};
