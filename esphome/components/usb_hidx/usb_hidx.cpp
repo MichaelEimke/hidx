@@ -945,6 +945,15 @@ void USBHIDXComponent::transfer_callback(usb_transfer_t *transfer) {
     // no dedicated driver.
     component->publish_raw_bindings(dev, transfer->data_buffer, transfer->actual_num_bytes);
 
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
+    char hex_buf[format_hex_pretty_size(32)];
+    ESP_LOGV(
+        TAG, "%s report on interface %u, EP 0x%02X (%u bytes): %s", label,
+        is_media ? dev->media_interface_num : dev->interface_num, transfer->bEndpointAddress,
+        transfer->actual_num_bytes,
+        format_hex_pretty_to(hex_buf, transfer->data_buffer, std::min<size_t>(transfer->actual_num_bytes, 32), ' '));
+#endif
+
     // Check if this is an idle report
     bool is_idle = false;
 
@@ -1048,10 +1057,37 @@ void USBHIDXComponent::transfer_callback(usb_transfer_t *transfer) {
 void USBHIDXComponent::setup_media_interface(HIDDevice *dev, const usb_config_desc_t *config_desc) {
   ESP_LOGI(TAG, "Searching for secondary HID interface...");
   // Interface numbers are not required to be contiguous or to start at zero.
+  // Prefer an interface without an interrupt OUT endpoint: vendor and
+  // configuration interfaces of composite devices usually have one, while
+  // consumer control interfaces do not. Fall back to the first other HID
+  // interface with an interrupt IN endpoint.
   const usb_intf_desc_t *intf_desc = nullptr;
   const usb_ep_desc_t *ep_desc = nullptr;
+  const usb_intf_desc_t *fallback_intf = nullptr;
+  const usb_ep_desc_t *fallback_ep = nullptr;
   const usb_intf_desc_t *candidate_intf = nullptr;
+  const usb_ep_desc_t *candidate_ep = nullptr;
+  bool candidate_has_out = false;
   int offset = 0;
+
+  // Returns true once a preferred interface has been selected.
+  auto finish_candidate = [&]() -> bool {
+    if (candidate_intf == nullptr || candidate_ep == nullptr) {
+      return false;
+    }
+    if (!candidate_has_out) {
+      intf_desc = candidate_intf;
+      ep_desc = candidate_ep;
+      return true;
+    }
+    ESP_LOGD(TAG, "Secondary HID interface %d has an OUT endpoint, keeping it as fallback",
+             candidate_intf->bInterfaceNumber);
+    if (fallback_intf == nullptr) {
+      fallback_intf = candidate_intf;
+      fallback_ep = candidate_ep;
+    }
+    return false;
+  };
 
   while (offset < config_desc->wTotalLength) {
     const usb_standard_desc_t *desc = (const usb_standard_desc_t *) ((uint8_t *) config_desc + offset);
@@ -1064,22 +1100,18 @@ void USBHIDXComponent::setup_media_interface(HIDDevice *dev, const usb_config_de
         ESP_LOGW(TAG, "Short media interface descriptor at offset %d", offset);
         break;
       }
+      if (finish_candidate()) {
+        break;
+      }
       const usb_intf_desc_t *temp_intf = (const usb_intf_desc_t *) desc;
       ESP_LOGD(TAG, "Found interface %d: Class=0x%02X", temp_intf->bInterfaceNumber, temp_intf->bInterfaceClass);
-      if (candidate_intf != nullptr) {
-        // The preceding secondary HID interface had no usable interrupt-IN
-        // endpoint. Continue scanning rather than making that interface block
-        // a later media interface in a composite keyboard.
-        candidate_intf = nullptr;
-      }
+      candidate_intf = nullptr;
+      candidate_ep = nullptr;
+      candidate_has_out = false;
       if (temp_intf->bInterfaceNumber != dev->interface_num && temp_intf->bInterfaceClass == 0x03 &&
           temp_intf->bAlternateSetting == 0) {
         candidate_intf = temp_intf;
         ESP_LOGI(TAG, "Found candidate secondary HID interface %d", temp_intf->bInterfaceNumber);
-      }
-      if (intf_desc != nullptr) {
-        // A valid endpoint was already found on the preceding interface.
-        break;
       }
     } else if (desc->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT && candidate_intf) {
       if (desc->bLength < sizeof(usb_ep_desc_t)) {
@@ -1087,22 +1119,32 @@ void USBHIDXComponent::setup_media_interface(HIDDevice *dev, const usb_config_de
         break;
       }
       const usb_ep_desc_t *temp_ep = (const usb_ep_desc_t *) desc;
-      if ((temp_ep->bEndpointAddress & 0x80) && ((temp_ep->bmAttributes & 0x03) == 0x03)) {
-        // A few composite keyboard receivers expose an invalid zero polling
-        // interval on the secondary interface. ESP-IDF rejects that value;
-        // use the minimum legal interval just as we do for the primary HID
-        // interface.
-        if (temp_ep->bInterval == 0) {
-          ESP_LOGW(TAG, "Fixing invalid bInterval=0 on media endpoint 0x%02X", temp_ep->bEndpointAddress);
-          const_cast<usb_ep_desc_t *>(temp_ep)->bInterval = 1;
+      if ((temp_ep->bmAttributes & 0x03) == 0x03) {
+        if (!(temp_ep->bEndpointAddress & 0x80)) {
+          candidate_has_out = true;
+        } else if (candidate_ep == nullptr) {
+          // A few composite keyboard receivers expose an invalid zero polling
+          // interval on the secondary interface. ESP-IDF rejects that value;
+          // use the minimum legal interval just as we do for the primary HID
+          // interface.
+          if (temp_ep->bInterval == 0) {
+            ESP_LOGW(TAG, "Fixing invalid bInterval=0 on media endpoint 0x%02X", temp_ep->bEndpointAddress);
+            const_cast<usb_ep_desc_t *>(temp_ep)->bInterval = 1;
+          }
+          candidate_ep = temp_ep;
         }
-        intf_desc = candidate_intf;
-        ep_desc = temp_ep;
-        ESP_LOGI(TAG, "Found media endpoint: 0x%02X", ep_desc->bEndpointAddress);
-        break;
       }
     }
     offset += desc->bLength;
+  }
+
+  if (intf_desc == nullptr && !finish_candidate() && fallback_intf != nullptr) {
+    intf_desc = fallback_intf;
+    ep_desc = fallback_ep;
+  }
+  if (ep_desc != nullptr) {
+    ESP_LOGI(TAG, "Found media endpoint 0x%02X on interface %d", ep_desc->bEndpointAddress,
+             intf_desc->bInterfaceNumber);
   }
 
   if (!intf_desc || !ep_desc) {
