@@ -109,9 +109,15 @@ KEYBOARD_SCHEMA = cv.Schema(
 MOUSE_SCHEMA = cv.Schema(
     {
         cv.Optional(CONF_DEVICE_ID): cv.string,
-        cv.Optional(CONF_LEFT_BUTTON): esphome_binary_sensor.binary_sensor_schema(),
-        cv.Optional(CONF_RIGHT_BUTTON): esphome_binary_sensor.binary_sensor_schema(),
-        cv.Optional(CONF_MIDDLE_BUTTON): esphome_binary_sensor.binary_sensor_schema(),
+        cv.Optional(CONF_LEFT_BUTTON): esphome_binary_sensor.binary_sensor_schema(
+            esphome_binary_sensor.BinarySensorInitiallyOff
+        ),
+        cv.Optional(CONF_RIGHT_BUTTON): esphome_binary_sensor.binary_sensor_schema(
+            esphome_binary_sensor.BinarySensorInitiallyOff
+        ),
+        cv.Optional(CONF_MIDDLE_BUTTON): esphome_binary_sensor.binary_sensor_schema(
+            esphome_binary_sensor.BinarySensorInitiallyOff
+        ),
         cv.Optional(CONF_X_DELTA): esphome_sensor.sensor_schema(),
         cv.Optional(CONF_Y_DELTA): esphome_sensor.sensor_schema(),
         cv.Optional(CONF_WHEEL): esphome_sensor.sensor_schema(),
@@ -124,8 +130,12 @@ GAMEPAD_SCHEMA = cv.Schema(
         cv.Optional(CONF_TYPE, default="generic"): cv.one_of(
             *DRIVER_ALIASES.keys(), lower=True
         ),
-        cv.Optional(CONF_BUTTON_A): esphome_binary_sensor.binary_sensor_schema(),
-        cv.Optional(CONF_BUTTON_B): esphome_binary_sensor.binary_sensor_schema(),
+        cv.Optional(CONF_BUTTON_A): esphome_binary_sensor.binary_sensor_schema(
+            esphome_binary_sensor.BinarySensorInitiallyOff
+        ),
+        cv.Optional(CONF_BUTTON_B): esphome_binary_sensor.binary_sensor_schema(
+            esphome_binary_sensor.BinarySensorInitiallyOff
+        ),
     }
 )
 

@@ -1,18 +1,15 @@
 import esphome.codegen as cg
 from esphome.components import binary_sensor
 import esphome.config_validation as cv
+from esphome.const import CONF_KEY, CONF_OFFSET, CONF_TYPE, CONF_VALUE
 
 from .. import DRIVER_ALIASES, USBHIDXComponent, enable_driver
 
 CONF_USB_HIDX_ID = "usb_hidx_id"
-CONF_TYPE = "type"
 CONF_DRIVER = "driver"
-CONF_KEY = "key"
 CONF_VID = "vid"
 CONF_PID = "pid"
-CONF_OFFSET = "offset"
 CONF_MASK = "mask"
-CONF_VALUE = "value"
 CONF_LEFT_BUTTON = "left_button"
 CONF_RIGHT_BUTTON = "right_button"
 CONF_MIDDLE_BUTTON = "middle_button"
@@ -37,7 +34,9 @@ CONF_DPAD_LEFT = "dpad_left"
 CONF_DPAD_RIGHT = "dpad_right"
 CONF_DPAD_DOWN = "dpad_down"
 
-CONFIG_SCHEMA = binary_sensor.binary_sensor_schema().extend(
+CONFIG_SCHEMA = binary_sensor.binary_sensor_schema(
+    binary_sensor.BinarySensorInitiallyOff
+).extend(
     {
         cv.GenerateID(CONF_USB_HIDX_ID): cv.use_id(USBHIDXComponent),
         cv.Required(CONF_TYPE): cv.one_of(
